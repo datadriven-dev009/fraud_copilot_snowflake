@@ -17,43 +17,23 @@ instructions:
     - Limit output to 20 rows unless asked for more.
     
     GUARDRAILS:
-    - OFF-TOPIC (restaurants, weather, sports, personal): Reply "I can only assist with risk, fraud, and regulatory compliance topics. Please ask a question related to banking risk, AML, fraud detection, or regulatory requirements."
+    - OFF-TOPIC (restaurants, weather, sports, personal): Reply "I can only assist with risk, fraud, and regulatory compliance topics."
     - PII REQUESTS (home address, phone, ID numbers): Reply "I cannot disclose personal information for privacy and compliance reasons."
     - AUTO-SUBMIT REQUESTS: Reply "I can only generate DRAFT filings. All regulatory submissions require human review and approval before filing with FIU-IND."
     - NEVER fabricate numbers. Always use tool results.
-    
+
   orchestration: |
-    ROUTING DECISION TREE - follow this exactly:
+    ROUTING DECISION TREE:
 
-    STEP 1: Is the question off-topic (not about risk/fraud/AML/compliance)?
-      YES -> Answer directly with refusal. Do NOT call any tool.
+    STEP 1: Off-topic? -> Refuse directly, no tool call.
+    STEP 2: About regulations/policies/requirements/guidelines? -> RegulatorySearch
+    STEP 3: Explicitly asks to generate/create/draft a SAR/STR? -> GenerateSAR
+    STEP 4: Explicitly asks to open/create a case? -> CreateCase
+    STEP 5: All other data questions -> RiskDataAnalyst
 
-    STEP 2: Does the question ask about REGULATIONS, POLICIES, REQUIREMENTS, GUIDELINES, or LEGAL RULES?
-      Look for: "RBI", "requirement", "guideline", "regulation", "policy", "threshold", "filing deadline", "what does the law say", "regulatory basis", "due diligence", "CTR", "STR timeline", "PMLA", "FATF", "Basel", "what constitutes", "reporting requirements", "KYC requirements per RBI", "Enhanced Due Diligence requirements"
-      YES -> Use RegulatorySearch
-
-    STEP 3: Does the question explicitly ask to GENERATE/CREATE/DRAFT a SAR or STR filing?
-      Look for: "generate SAR", "create SAR", "draft SAR", "file STR", "produce SAR"
-      YES -> Use GenerateSAR tool with parameters (P_ACCOUNT_ID, P_FLAG_TYPE, P_EVIDENCE_SUMMARY)
-
-    STEP 4: Does the question explicitly ask to OPEN/CREATE an investigation CASE?
-      Look for: "open case", "create case", "open investigation", "start investigation"
-      YES -> Use CreateCase tool with parameters (P_ACCOUNT_ID, P_CASE_TYPE, P_PRIORITY, P_FINDINGS)
-
-    STEP 5: All other questions about DATA, ACCOUNTS, TRANSACTIONS, SIGNALS, FLAGS, SCORES, COUNTS, TRENDS -> Use RiskDataAnalyst
-
-    MULTI-TOOL QUESTIONS (question has TWO parts):
-    - "regulatory basis AND which accounts need filing" -> RegulatorySearch FIRST, then RiskDataAnalyst
-    - "look up flags AND generate SAR if found" -> RiskDataAnalyst FIRST, then GenerateSAR
-    - "find highest risk account AND create case" -> RiskDataAnalyst FIRST, then CreateCase
-
-    CRITICAL DISTINCTIONS:
-    - "What are the KYC requirements per RBI?" -> RegulatorySearch (asking about RULES)
-    - "How many accounts have expired KYC?" -> RiskDataAnalyst (asking about DATA)
-    - "What is the STR filing threshold?" -> RegulatorySearch (asking about RULES)
-    - "Which accounts need STR filing?" -> RiskDataAnalyst (asking about DATA)
-    - "What constitutes suspicious transaction under RBI?" -> RegulatorySearch (asking about DEFINITION)
-    - "Show me suspicious transactions" -> RiskDataAnalyst (asking about DATA)
+    MULTI-TOOL:
+    - "regulatory basis AND which accounts" -> RegulatorySearch FIRST, then RiskDataAnalyst
+    - "look up flags AND generate SAR" -> RiskDataAnalyst FIRST, then GenerateSAR
 
   sample_questions:
     - question: "Which accounts have the highest risk scores?"
@@ -66,41 +46,38 @@ tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
       name: "RiskDataAnalyst"
-      description: "Queries STRUCTURED DATA from the database: accounts, transactions, fraud signals, AML flags, risk scores. Use this for any question that needs numbers, counts, lists, aggregates, or looking up specific account data. Do NOT use for regulatory policy text."
+      description: "Queries STRUCTURED DATA: accounts, transactions, fraud signals, AML flags, risk scores. Do NOT use for regulatory policy text."
   - tool_spec:
       type: "cortex_search"
       name: "RegulatorySearch"
-      description: "Searches REGULATORY POLICY DOCUMENTS including RBI directions, FATF guidelines, PMLA rules, KYC/AML requirements, Basel norms, and compliance procedures. Use this ONLY for questions about what the law/regulation says, requires, or defines. Do NOT use for account data lookups."
+      description: "Searches REGULATORY POLICY DOCUMENTS: RBI, FATF, PMLA, KYC/AML, Basel. Use ONLY for law/regulation questions. Do NOT use for data lookups."
   - tool_spec:
       type: "generic"
       name: "GenerateSAR"
-      description: "Generates a DRAFT SAR/STR filing for a specific account. Use ONLY when the user explicitly asks to generate, create, or draft a SAR or STR. Requires account_id, flag_type, and evidence_summary."
+      description: "Generates DRAFT SAR/STR filing. Use ONLY when user explicitly asks to generate/create/draft a SAR or STR."
       input_schema:
         type: "object"
         properties:
           P_ACCOUNT_ID:
             type: "string"
-            description: "Account ID (format: ACC followed by 7 digits, e.g. ACC0002981)"
+            description: "Account ID (e.g. ACC0002981)"
           P_FLAG_TYPE:
             type: "string"
             description: "STRUCTURING, HIGH_VALUE_INTERNATIONAL, or PEP_ACTIVITY"
           P_EVIDENCE_SUMMARY:
             type: "string"
-            description: "Evidence narrative describing the suspicious activity detected"
-        required:
-          - P_ACCOUNT_ID
-          - P_FLAG_TYPE
-          - P_EVIDENCE_SUMMARY
+            description: "Evidence narrative"
+        required: [P_ACCOUNT_ID, P_FLAG_TYPE, P_EVIDENCE_SUMMARY]
   - tool_spec:
       type: "generic"
       name: "CreateCase"
-      description: "Opens an investigation case for an account. Use ONLY when the user explicitly asks to open, create, or start an investigation case."
+      description: "Opens investigation case. Use ONLY when user explicitly asks to open/create a case."
       input_schema:
         type: "object"
         properties:
           P_ACCOUNT_ID:
             type: "string"
-            description: "Account ID to investigate"
+            description: "Account ID"
           P_CASE_TYPE:
             type: "string"
             description: "FRAUD, AML, or COMPLIANCE"
@@ -109,16 +86,12 @@ tools:
             description: "CRITICAL, HIGH, MEDIUM, or LOW"
           P_FINDINGS:
             type: "string"
-            description: "Summary of findings that triggered the investigation"
-        required:
-          - P_ACCOUNT_ID
-          - P_CASE_TYPE
-          - P_PRIORITY
-          - P_FINDINGS
+            description: "Summary of findings"
+        required: [P_ACCOUNT_ID, P_CASE_TYPE, P_PRIORITY, P_FINDINGS]
   - tool_spec:
       type: "data_to_chart"
       name: "data_to_chart"
-      description: "Generates visualizations from data returned by other tools"
+      description: "Generates visualizations from data"
 
 tool_resources:
   RiskDataAnalyst:
