@@ -1,0 +1,329 @@
+name: Risk_Fraud_Intelligence
+tables:
+  - name: accounts
+    base_table:
+      database: RISK_FRAUD_COPILOT
+      schema: RAW
+      table: ACCOUNTS
+    description: "Customer accounts with KYC status and risk classification"
+    dimensions:
+      - name: account_id
+        expr: account_id
+        description: "Unique account identifier"
+        unique: true
+      - name: customer_name
+        expr: customer_name
+        description: "Customer full name"
+      - name: account_type
+        expr: account_type
+        description: "Account type: SAVINGS, CURRENT, LOAN, CREDIT_CARD"
+      - name: kyc_status
+        expr: kyc_status
+        description: "KYC verification status: VERIFIED, PENDING, EXPIRED"
+      - name: risk_tier
+        expr: risk_tier
+        description: "Assigned risk tier: LOW, MEDIUM, HIGH"
+      - name: country
+        expr: country
+        description: "Customer country"
+      - name: pep_flag
+        expr: pep_flag
+        description: "Whether customer is a Politically Exposed Person"
+      - name: sanctions_flag
+        expr: sanctions_flag
+        description: "Whether customer is on sanctions list"
+    time_dimensions:
+      - name: opened_date
+        expr: opened_date
+        description: "Date account was opened"
+        data_type: DATE
+    measures:
+      - name: total_accounts
+        expr: "COUNT(account_id)"
+        description: "Total number of accounts"
+      - name: avg_income
+        expr: "AVG(annual_income)"
+        description: "Average annual income of customers"
+      - name: high_risk_account_count
+        expr: "COUNT(CASE WHEN risk_tier = 'HIGH' THEN 1 END)"
+        description: "Number of high-risk accounts"
+      - name: pep_count
+        expr: "COUNT(CASE WHEN pep_flag = TRUE THEN 1 END)"
+        description: "Number of PEP accounts"
+
+  - name: transactions
+    base_table:
+      database: RISK_FRAUD_COPILOT
+      schema: RAW
+      table: TRANSACTIONS
+    description: "Financial transactions with fraud labels"
+    dimensions:
+      - name: txn_id
+        expr: txn_id
+        description: "Unique transaction identifier"
+        unique: true
+      - name: account_id
+        expr: account_id
+        description: "Account that made the transaction"
+      - name: txn_type
+        expr: txn_type
+        description: "Transaction type: DEBIT, CREDIT, TRANSFER, ATM, POS, ONLINE"
+      - name: merchant_category
+        expr: merchant_category
+        description: "Merchant category: RETAIL, CRYPTO, GAMBLING, REAL_ESTATE, etc."
+      - name: merchant_country
+        expr: merchant_country
+        description: "Country where merchant is located"
+      - name: channel
+        expr: channel
+        description: "Transaction channel: MOBILE, WEB, BRANCH, ATM"
+      - name: is_international
+        expr: is_international
+        description: "Whether transaction is international"
+      - name: fraud_label
+        expr: fraud_label
+        description: "Whether transaction is labeled as fraudulent"
+      - name: currency
+        expr: currency
+        description: "Transaction currency"
+    time_dimensions:
+      - name: txn_timestamp
+        expr: txn_timestamp
+        description: "Timestamp when transaction occurred"
+        data_type: TIMESTAMP
+    measures:
+      - name: total_transactions
+        expr: "COUNT(txn_id)"
+        description: "Total number of transactions"
+      - name: total_amount
+        expr: "SUM(amount)"
+        description: "Total transaction amount"
+      - name: avg_amount
+        expr: "AVG(amount)"
+        description: "Average transaction amount"
+      - name: max_amount
+        expr: "MAX(amount)"
+        description: "Maximum single transaction amount"
+      - name: fraud_transaction_count
+        expr: "COUNT(CASE WHEN fraud_label = TRUE THEN 1 END)"
+        description: "Number of fraudulent transactions"
+      - name: international_transaction_count
+        expr: "COUNT(CASE WHEN is_international = TRUE THEN 1 END)"
+        description: "Number of international transactions"
+      - name: fraud_rate
+        expr: "COUNT(CASE WHEN fraud_label = TRUE THEN 1 END)::FLOAT / NULLIF(COUNT(txn_id), 0)"
+        description: "Fraud rate as percentage of total transactions"
+
+  - name: fraud_signals
+    base_table:
+      database: RISK_FRAUD_COPILOT
+      schema: PROCESSED
+      table: FRAUD_SIGNALS
+    description: "Detected fraud signals from transaction monitoring"
+    dimensions:
+      - name: txn_id
+        expr: txn_id
+        description: "Transaction that triggered the signal"
+      - name: account_id
+        expr: account_id
+        description: "Account associated with the fraud signal"
+      - name: signal_type
+        expr: signal_type
+        description: "Type of fraud signal: VELOCITY_1MIN, VELOCITY_1HR, AMOUNT_ANOMALY, HIGH_RISK_COUNTRY, HIGH_RISK_CATEGORY"
+      - name: severity
+        expr: severity
+        description: "Signal severity: CRITICAL, HIGH, MEDIUM, LOW"
+      - name: merchant_country
+        expr: merchant_country
+        description: "Country where suspicious activity occurred"
+      - name: merchant_category
+        expr: merchant_category
+        description: "Merchant category of suspicious transaction"
+    time_dimensions:
+      - name: signal_timestamp
+        expr: signal_timestamp
+        description: "When the fraud signal was detected"
+        data_type: TIMESTAMP
+    measures:
+      - name: total_signals
+        expr: "COUNT(*)"
+        description: "Total number of fraud signals"
+      - name: critical_signals
+        expr: "COUNT(CASE WHEN severity = 'CRITICAL' THEN 1 END)"
+        description: "Number of critical severity signals"
+      - name: high_signals
+        expr: "COUNT(CASE WHEN severity = 'HIGH' THEN 1 END)"
+        description: "Number of high severity signals"
+      - name: avg_confidence
+        expr: "AVG(confidence_score)"
+        description: "Average confidence score of detected signals"
+      - name: total_flagged_amount
+        expr: "SUM(amount)"
+        description: "Total monetary amount of flagged transactions"
+
+  - name: aml_flags
+    base_table:
+      database: RISK_FRAUD_COPILOT
+      schema: PROCESSED
+      table: AML_FLAGS
+    description: "Anti-Money Laundering flags including structuring, high-value international transfers, and PEP activity"
+    dimensions:
+      - name: account_id
+        expr: account_id
+        description: "Account flagged for AML concerns"
+      - name: flag_type
+        expr: flag_type
+        description: "Type of AML flag: STRUCTURING, HIGH_VALUE_INTERNATIONAL, PEP_ACTIVITY"
+      - name: severity
+        expr: severity
+        description: "Flag severity: HIGH, MEDIUM, LOW"
+      - name: required_action
+        expr: required_action
+        description: "Action required: FILE_STR, ENHANCED_DUE_DILIGENCE, SENIOR_REVIEW"
+      - name: description
+        expr: description
+        description: "Detailed description of the AML flag"
+    time_dimensions:
+      - name: flag_date
+        expr: flag_date
+        description: "Date when AML flag was raised"
+        data_type: DATE
+    measures:
+      - name: total_aml_flags
+        expr: "COUNT(*)"
+        description: "Total number of AML flags"
+      - name: structuring_flags
+        expr: "COUNT(CASE WHEN flag_type = 'STRUCTURING' THEN 1 END)"
+        description: "Number of structuring detection flags"
+      - name: high_severity_flags
+        expr: "COUNT(CASE WHEN severity = 'HIGH' THEN 1 END)"
+        description: "Number of high severity AML flags"
+      - name: avg_confidence
+        expr: "AVG(confidence_score)"
+        description: "Average confidence of AML flags"
+
+  - name: risk_scores
+    base_table:
+      database: RISK_FRAUD_COPILOT
+      schema: PROCESSED
+      table: RISK_SCORES
+    description: "Composite risk scores per account combining fraud, compliance, and transaction risk dimensions"
+    dimensions:
+      - name: account_id
+        expr: account_id
+        description: "Account identifier"
+        unique: true
+      - name: customer_name
+        expr: customer_name
+        description: "Customer name"
+      - name: account_type
+        expr: account_type
+        description: "Account type"
+      - name: assigned_tier
+        expr: assigned_tier
+        description: "Originally assigned risk tier"
+      - name: fraud_risk_level
+        expr: fraud_risk_level
+        description: "Computed fraud risk level: HIGH, MEDIUM, LOW"
+      - name: compliance_risk_level
+        expr: compliance_risk_level
+        description: "Computed compliance risk level: HIGH, MEDIUM, LOW"
+      - name: pep_flag
+        expr: pep_flag
+        description: "PEP status"
+      - name: sanctions_flag
+        expr: sanctions_flag
+        description: "Sanctions status"
+      - name: kyc_status
+        expr: kyc_status
+        description: "KYC verification status"
+    measures:
+      - name: avg_risk_score
+        expr: "AVG(composite_risk_score)"
+        description: "Average composite risk score across accounts"
+      - name: max_risk_score
+        expr: "MAX(composite_risk_score)"
+        description: "Maximum composite risk score"
+      - name: high_risk_accounts
+        expr: "COUNT(CASE WHEN composite_risk_score > 50 THEN 1 END)"
+        description: "Number of accounts with risk score above 50"
+      - name: total_exposure
+        expr: "SUM(total_transaction_volume)"
+        description: "Total transaction volume exposure"
+      - name: flagged_transactions_total
+        expr: "SUM(flagged_transaction_count)"
+        description: "Total flagged transactions across all accounts"
+
+relationships:
+  - name: account_transactions
+    left_table: accounts
+    right_table: transactions
+    join_type: one_to_many
+    relationship_columns:
+      - left_column: account_id
+        right_column: account_id
+  - name: account_fraud_signals
+    left_table: accounts
+    right_table: fraud_signals
+    join_type: one_to_many
+    relationship_columns:
+      - left_column: account_id
+        right_column: account_id
+  - name: account_aml_flags
+    left_table: accounts
+    right_table: aml_flags
+    join_type: one_to_many
+    relationship_columns:
+      - left_column: account_id
+        right_column: account_id
+  - name: account_risk_scores
+    left_table: accounts
+    right_table: risk_scores
+    join_type: one_to_one
+    relationship_columns:
+      - left_column: account_id
+        right_column: account_id
+  - name: transaction_fraud_signals
+    left_table: transactions
+    right_table: fraud_signals
+    join_type: one_to_many
+    relationship_columns:
+      - left_column: txn_id
+        right_column: txn_id
+
+verified_queries:
+  - name: "high_risk_accounts_summary"
+    question: "Which accounts have the highest risk scores?"
+    sql: "SELECT account_id, customer_name, composite_risk_score, fraud_risk_level, compliance_risk_level, total_transaction_volume, flagged_transaction_count FROM RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES WHERE composite_risk_score > 50 ORDER BY composite_risk_score DESC LIMIT 20"
+    verified_at: 1724284800
+    verified_by: "admin"
+
+  - name: "aml_alerts_requiring_sar"
+    question: "Which accounts triggered AML alerts that require SAR filing?"
+    sql: "SELECT a.account_id, a.flag_type, a.description, a.flag_date, a.severity, a.required_action, r.customer_name, r.composite_risk_score FROM RISK_FRAUD_COPILOT.PROCESSED.AML_FLAGS a JOIN RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES r ON a.account_id = r.account_id WHERE a.required_action = 'FILE_STR' ORDER BY a.flag_date DESC"
+    verified_at: 1724284800
+    verified_by: "admin"
+
+  - name: "fraud_signals_this_week"
+    question: "What fraud signals were detected this week?"
+    sql: "SELECT signal_type, severity, COUNT(*) as signal_count, SUM(amount) as total_amount, AVG(confidence_score) as avg_confidence FROM RISK_FRAUD_COPILOT.PROCESSED.FRAUD_SIGNALS WHERE signal_timestamp >= DATEADD(day, -7, CURRENT_TIMESTAMP()) GROUP BY signal_type, severity ORDER BY signal_count DESC"
+    verified_at: 1724284800
+    verified_by: "admin"
+
+  - name: "portfolio_risk_by_tier"
+    question: "What is the portfolio risk exposure by tier?"
+    sql: "SELECT assigned_tier, COUNT(*) as account_count, AVG(composite_risk_score) as avg_risk_score, SUM(total_transaction_volume) as total_exposure, SUM(flagged_transaction_count) as total_flags FROM RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES GROUP BY assigned_tier ORDER BY avg_risk_score DESC"
+    verified_at: 1724284800
+    verified_by: "admin"
+
+  - name: "structuring_detection_summary"
+    question: "Show me accounts with potential structuring activity"
+    sql: "SELECT a.account_id, r.customer_name, a.flag_date, a.description, a.confidence_score, r.composite_risk_score, r.kyc_status FROM RISK_FRAUD_COPILOT.PROCESSED.AML_FLAGS a JOIN RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES r ON a.account_id = r.account_id WHERE a.flag_type = 'STRUCTURING' ORDER BY a.confidence_score DESC, a.flag_date DESC"
+    verified_at: 1724284800
+    verified_by: "admin"
+
+  - name: "pep_account_monitoring"
+    question: "Show PEP accounts and their recent activity"
+    sql: "SELECT r.account_id, r.customer_name, r.composite_risk_score, r.total_transaction_volume, r.flagged_transaction_count, r.kyc_status, COUNT(f.txn_id) as fraud_signal_count FROM RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES r LEFT JOIN RISK_FRAUD_COPILOT.PROCESSED.FRAUD_SIGNALS f ON r.account_id = f.account_id WHERE r.pep_flag = TRUE GROUP BY r.account_id, r.customer_name, r.composite_risk_score, r.total_transaction_volume, r.flagged_transaction_count, r.kyc_status ORDER BY r.composite_risk_score DESC"
+    verified_at: 1724284800
+    verified_by: "admin"
