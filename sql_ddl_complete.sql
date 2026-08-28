@@ -766,26 +766,64 @@ CREATE OR REPLACE AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT
   FROM SPECIFICATION
   $$
   models:
-    orchestration: auto
+    orchestration: claude sonnet 4.5
 
   orchestration:
     budget:
-      seconds: 60
-      tokens: 16000
+      seconds: 120
+      tokens: 32000
 
   instructions:
     response: |
-      You are a Risk, Fraud, and Regulatory Intelligence Copilot for a banking compliance team.
-      Always include account_id when referencing specific accounts.
-      State your confidence level (HIGH/MEDIUM/LOW) based on data completeness.
-      Structure findings as: Signal -> Evidence -> Conclusion -> Recommended Action.
-      For SAR/STR filing questions, always reference the specific regulatory threshold.
-      If you cannot find sufficient evidence, say so clearly - never hallucinate.
+      You are the Risk, Fraud and Regulatory Intelligence Copilot.
+
+      FORMAT RULES:
+      - Include ACCOUNT_ID in every account-level answer.
+      - Round monetary values to 2 decimal places in INR.
+      - Default time window: last 30 days.
+      - Limit output to 20 rows unless asked for more.
+      - Keep total response under 500 words. Summarize data tables concisely rather than repeating raw output verbatim.
+      - When presenting query results, show key insights and summary statistics, not full row-by-row dumps.
+
+      GUARDRAILS:
+      - OFF-TOPIC (restaurants, weather, sports, personal): Reply "I can only assist with risk, fraud, and regulatory compliance topics. Please ask a question related to banking risk, AML, fraud detection, or regulatory requirements."
+      - PII REQUESTS (home address, phone, ID numbers): Reply "I cannot disclose personal information for privacy and compliance reasons."
+      - AUTO-SUBMIT REQUESTS: Reply "I can only generate DRAFT filings. All regulatory submissions require human review and approval before filing with FIU-IND."
+      - NEVER fabricate numbers. Always use tool results.
+
     orchestration: |
-      For fraud signal or risk score queries, use the Analyst tool to query the semantic view.
-      For regulatory policy questions (AML, Basel, PMLA, KYC requirements), use the RegSearch tool.
-      For questions that combine data and regulation, use both tools.
-      Always start with structured data queries for quantitative questions.
+      ROUTING DECISION TREE - follow this exactly:
+
+      STEP 1: Is the question off-topic (not about risk/fraud/AML/compliance)?
+        YES → Answer directly with refusal. Do NOT call any tool.
+
+      STEP 2: Does the question ask about REGULATIONS, POLICIES, REQUIREMENTS, GUIDELINES, or LEGAL RULES?
+        Look for: "RBI", "requirement", "guideline", "regulation", "policy", "threshold", "filing deadline", "what does the law say", "regulatory basis", "due diligence", "CTR", "STR timeline", "PMLA", "FATF", "Basel", "what constitutes", "reporting requirements", "KYC requirements per RBI", "Enhanced Due Diligence requirements"
+        YES → Use RegulatorySearch
+
+      STEP 3: Does the question explicitly ask to GENERATE/CREATE/DRAFT a SAR or STR filing?
+        Look for: "generate SAR", "create SAR", "draft SAR", "file STR", "produce SAR"
+        YES → Use GenerateSAR tool with parameters (P_ACCOUNT_ID, P_FLAG_TYPE, P_EVIDENCE_SUMMARY)
+
+      STEP 4: Does the question explicitly ask to OPEN/CREATE an investigation CASE?
+        Look for: "open case", "create case", "open investigation", "start investigation"
+        YES → Use CreateCase tool with parameters (P_ACCOUNT_ID, P_CASE_TYPE, P_PRIORITY, P_FINDINGS)
+
+      STEP 5: All other questions about DATA, ACCOUNTS, TRANSACTIONS, SIGNALS, FLAGS, SCORES, COUNTS, TRENDS → Use RiskDataAnalyst
+
+      MULTI-TOOL QUESTIONS (question has TWO parts):
+      - "regulatory basis AND which accounts need filing" → RegulatorySearch FIRST, then RiskDataAnalyst
+      - "look up flags AND generate SAR if found" → RiskDataAnalyst FIRST, then GenerateSAR
+      - "find highest risk account AND create case" → RiskDataAnalyst FIRST, then CreateCase
+
+      CRITICAL DISTINCTIONS:
+      - "What are the KYC requirements per RBI?" → RegulatorySearch (asking about RULES)
+      - "How many accounts have expired KYC?" → RiskDataAnalyst (asking about DATA)
+      - "What is the STR filing threshold?" → RegulatorySearch (asking about RULES)
+      - "Which accounts need STR filing?" → RiskDataAnalyst (asking about DATA)
+      - "What constitutes suspicious transaction under RBI?" → RegulatorySearch (asking about DEFINITION)
+      - "Show me suspicious transactions" → RiskDataAnalyst (asking about DATA)
+
     sample_questions:
       - question: "Which accounts triggered AML alerts this week?"
       - question: "What is the SAR filing threshold under RBI guidelines?"
@@ -874,8 +912,199 @@ BEGIN
 END;
 
 -- ============================================================
--- SECTION 9: VALIDATION QUERIES
+-- SECTION 9: ADDITIONAL TABLES (Case Management & Audit)
 -- ============================================================
+
+-- 9.1 Audit Log Table
+CREATE OR REPLACE TABLE RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (
+    LOG_ID VARCHAR(36) DEFAULT UUID_STRING(),
+    ACTION_TIMESTAMP TIMESTAMP_LTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+    USER_ID VARCHAR(100),
+    ACTION_TYPE VARCHAR(50),
+    ENTITY_TYPE VARCHAR(30),
+    ENTITY_ID VARCHAR(50),
+    QUERY_TEXT VARCHAR(16777216),
+    RESPONSE_SUMMARY VARCHAR(16777216),
+    CONFIDENCE_SCORE NUMBER(3,2),
+    METADATA VARIANT
+);
+
+-- 9.2 Case Management Table
+CREATE OR REPLACE TABLE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT (
+    CASE_ID VARCHAR(20),
+    ACCOUNT_ID VARCHAR(20) NOT NULL,
+    CASE_TYPE VARCHAR(30) NOT NULL,
+    STATUS VARCHAR(20) DEFAULT 'OPEN',
+    PRIORITY VARCHAR(10),
+    CREATED_AT TIMESTAMP_LTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+    ASSIGNED_TO VARCHAR(100),
+    FINDINGS VARCHAR(16777216),
+    RESOLUTION VARCHAR(16777216),
+    CLOSED_AT TIMESTAMP_LTZ(9),
+    LINKED_SAR_ID VARCHAR(20)
+);
+
+-- 9.3 SAR Filings Table
+CREATE OR REPLACE TABLE RISK_FRAUD_COPILOT.PROCESSED.SAR_FILINGS (
+    SAR_ID VARCHAR(20),
+    ACCOUNT_ID VARCHAR(20) NOT NULL,
+    FILING_DATE TIMESTAMP_LTZ(9) DEFAULT CURRENT_TIMESTAMP(),
+    REPORT_TYPE VARCHAR(20) NOT NULL,
+    STATUS VARCHAR(20) DEFAULT 'DRAFT',
+    NARRATIVE VARCHAR(16777216),
+    EVIDENCE_JSON VARIANT,
+    REGULATORY_BODY VARCHAR(50),
+    GENERATED_BY VARCHAR(50) DEFAULT 'COPILOT_AGENT',
+    REVIEWED_BY VARCHAR(100),
+    SUBMITTED_AT TIMESTAMP_LTZ(9)
+);
+
+-- ============================================================
+-- SECTION 10: ADDITIONAL STORED PROCEDURES
+-- ============================================================
+
+-- 10.1 Create Investigation Case
+CREATE OR REPLACE PROCEDURE RISK_FRAUD_COPILOT.APP.CREATE_INVESTIGATION_CASE(
+    P_ACCOUNT_ID VARCHAR,
+    P_CASE_TYPE VARCHAR,
+    P_PRIORITY VARCHAR,
+    P_FINDINGS VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+BEGIN
+    LET case_id VARCHAR := 'CASE' || LPAD(UNIFORM(100000, 999999, RANDOM())::VARCHAR, 6, '0');
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT (
+        CASE_ID, ACCOUNT_ID, CASE_TYPE, PRIORITY, FINDINGS
+    )
+    VALUES (:case_id, :P_ACCOUNT_ID, :P_CASE_TYPE, :P_PRIORITY, :P_FINDINGS);
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY)
+    VALUES ('CASE_CREATED', 'CASE', :case_id, :P_CASE_TYPE || ' case opened for ' || :P_ACCOUNT_ID);
+
+    RETURN 'Investigation case ' || :case_id || ' created. Type: ' || :P_CASE_TYPE || ', Priority: ' || :P_PRIORITY || '. Status: OPEN.';
+END;
+
+-- 10.2 Generate SAR Report
+CREATE OR REPLACE PROCEDURE RISK_FRAUD_COPILOT.APP.GENERATE_SAR_REPORT(
+    P_ACCOUNT_ID VARCHAR,
+    P_FLAG_TYPE VARCHAR,
+    P_EVIDENCE_SUMMARY VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+BEGIN
+    LET sar_id VARCHAR := 'SAR' || LPAD(UNIFORM(1000000, 9999999, RANDOM())::VARCHAR, 7, '0');
+    LET report_type VARCHAR;
+    IF (:P_FLAG_TYPE = 'STRUCTURING') THEN
+        report_type := 'STR';
+    ELSE
+        report_type := 'SAR';
+    END IF;
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.SAR_FILINGS (
+        SAR_ID, ACCOUNT_ID, REPORT_TYPE, STATUS, NARRATIVE, EVIDENCE_JSON, REGULATORY_BODY
+    )
+    VALUES (
+        :sar_id,
+        :P_ACCOUNT_ID,
+        :report_type,
+        'DRAFT',
+        :P_EVIDENCE_SUMMARY,
+        OBJECT_CONSTRUCT(
+            'account_id', :P_ACCOUNT_ID,
+            'flag_type', :P_FLAG_TYPE,
+            'generated_at', CURRENT_TIMESTAMP()::VARCHAR,
+            'evidence', :P_EVIDENCE_SUMMARY
+        ),
+        'FIU-IND'
+    );
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY)
+    VALUES ('SAR_GENERATED', 'SAR', :sar_id, 'SAR filing draft generated for account ' || :P_ACCOUNT_ID);
+
+    RETURN :sar_id || ' created as DRAFT for account ' || :P_ACCOUNT_ID || '. Type: ' || :P_FLAG_TYPE || '. Requires human review before submission to FIU-IND.';
+END;
+
+-- ============================================================
+-- SECTION 11: ROLES & GRANTS
+-- ============================================================
+
+-- 11.1 Create AI_TRAINER role
+CREATE ROLE IF NOT EXISTS AI_TRAINER;
+GRANT ROLE AI_TRAINER TO USER ADMIN;
+
+-- 11.2 Warehouse grants
+GRANT USAGE ON WAREHOUSE ANALYTICS_WH TO ROLE AI_TRAINER;
+GRANT OPERATE ON WAREHOUSE ANALYTICS_WH TO ROLE AI_TRAINER;
+
+-- 11.3 Database & Schema grants
+GRANT USAGE ON DATABASE RISK_FRAUD_COPILOT TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.RAW TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.PROCESSED TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.DOCUMENTS TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.SEMANTIC TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+GRANT USAGE ON SCHEMA RISK_FRAUD_COPILOT.PUBLIC TO ROLE AI_TRAINER;
+
+-- 11.4 Table grants (RAW schema - SELECT)
+GRANT SELECT ON ALL TABLES IN SCHEMA RISK_FRAUD_COPILOT.RAW TO ROLE AI_TRAINER;
+
+-- 11.5 Dynamic table grants (PROCESSED schema - SELECT)
+GRANT SELECT ON ALL DYNAMIC TABLES IN SCHEMA RISK_FRAUD_COPILOT.PROCESSED TO ROLE AI_TRAINER;
+
+-- 11.6 Table grants (PROCESSED schema - SELECT + INSERT for operational tables)
+GRANT SELECT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG TO ROLE AI_TRAINER;
+GRANT INSERT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG TO ROLE AI_TRAINER;
+GRANT SELECT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT TO ROLE AI_TRAINER;
+GRANT INSERT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT TO ROLE AI_TRAINER;
+GRANT SELECT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.SAR_FILINGS TO ROLE AI_TRAINER;
+GRANT INSERT ON TABLE RISK_FRAUD_COPILOT.PROCESSED.SAR_FILINGS TO ROLE AI_TRAINER;
+
+-- 11.7 Table grants (DOCUMENTS & APP schemas)
+GRANT SELECT ON TABLE RISK_FRAUD_COPILOT.DOCUMENTS.REGULATORY_DOCS TO ROLE AI_TRAINER;
+GRANT SELECT ON ALL TABLES IN SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+
+-- 11.8 Cortex Search Service grant
+GRANT USAGE ON CORTEX SEARCH SERVICE RISK_FRAUD_COPILOT.DOCUMENTS.REGULATORY_SEARCH TO ROLE AI_TRAINER;
+
+-- 11.9 Semantic View grants
+GRANT SELECT ON SEMANTIC VIEW RISK_FRAUD_COPILOT.SEMANTIC.RISK_FRAUD_INTELLIGENCE TO ROLE AI_TRAINER;
+GRANT REFERENCES ON SEMANTIC VIEW RISK_FRAUD_COPILOT.SEMANTIC.RISK_FRAUD_INTELLIGENCE TO ROLE AI_TRAINER;
+
+-- 11.10 Cortex Agent grant
+GRANT USAGE ON CORTEX AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
+GRANT MONITOR ON CORTEX AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
+
+-- 11.11 Procedure grants
+GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.CREATE_INVESTIGATION_CASE(VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
+GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.GENERATE_SAR_REPORT(VARCHAR, VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
+
+-- 11.12 Schema-level create privileges for APP schema
+GRANT CREATE TASK ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+GRANT CREATE FILE FORMAT ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+GRANT CREATE STAGE ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+GRANT CREATE DATASET ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+
+-- 11.13 Account-level grants
+GRANT EXECUTE TASK ON ACCOUNT TO ROLE AI_TRAINER;
+
+-- 11.14 Database role grants
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE AI_TRAINER;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_AGENT_USER TO ROLE AI_TRAINER;
+
+-- 11.15 Grant USAGE on DATABASE to PUBLIC (for agent accessibility)
+GRANT USAGE ON DATABASE RISK_FRAUD_COPILOT TO ROLE PUBLIC;
+
+-- ============================================================
+-- SECTION 12: VALIDATION QUERIES
+-- ============================================================
+
 
 -- Verify data counts
 SELECT 'ACCOUNTS' AS table_name, COUNT(*) AS row_count FROM RISK_FRAUD_COPILOT.RAW.ACCOUNTS
