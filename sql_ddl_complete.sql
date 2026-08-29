@@ -17,6 +17,9 @@ CREATE SCHEMA IF NOT EXISTS SEMANTIC;
 CREATE SCHEMA IF NOT EXISTS DOCUMENTS;
 CREATE SCHEMA IF NOT EXISTS APP;
 
+-- Warehouses
+CREATE WAREHOUSE IF NOT EXISTS ANALYTICS_WH WITH WAREHOUSE_SIZE = 'SMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE;
+
 -- ============================================================
 -- SECTION 2: RAW TABLES (DDL + Data Generation)
 -- ============================================================
@@ -785,11 +788,18 @@ CREATE OR REPLACE AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT
       - Keep total response under 500 words. Summarize data tables concisely rather than repeating raw output verbatim.
       - When presenting query results, show key insights and summary statistics, not full row-by-row dumps.
 
+      EVIDENCE AND CITATIONS:
+      - When citing regulatory documents from search results, format as: [Source: {doc_title} > {section_title}]
+      - When presenting data results, include context: "Based on {N} matching records with average confidence {X}"
+      - Structure every finding as: SIGNAL -> EVIDENCE -> FINDING -> RECOMMENDED ACTION
+      - If any AML flag has confidence_score < 0.7, append: "Low confidence flag detected. Manual verification recommended before action."
+
       GUARDRAILS:
       - OFF-TOPIC (restaurants, weather, sports, personal): Reply "I can only assist with risk, fraud, and regulatory compliance topics. Please ask a question related to banking risk, AML, fraud detection, or regulatory requirements."
       - PII REQUESTS (home address, phone, ID numbers): Reply "I cannot disclose personal information for privacy and compliance reasons."
       - AUTO-SUBMIT REQUESTS: Reply "I can only generate DRAFT filings. All regulatory submissions require human review and approval before filing with FIU-IND."
       - NEVER fabricate numbers. Always use tool results.
+      - CONFIDENCE THRESHOLD: When confidence_score < 0.5, explicitly state "Insufficient confidence for automated action. Escalate to senior compliance officer."
 
     orchestration: |
       ROUTING DECISION TREE - follow this exactly:
@@ -1040,6 +1050,7 @@ CREATE ROLE IF NOT EXISTS AI_TRAINER;
 GRANT ROLE AI_TRAINER TO USER ADMIN;
 
 -- 11.2 Warehouse grants
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE AI_TRAINER;
 GRANT USAGE ON WAREHOUSE ANALYTICS_WH TO ROLE AI_TRAINER;
 GRANT OPERATE ON WAREHOUSE ANALYTICS_WH TO ROLE AI_TRAINER;
 
@@ -1077,9 +1088,9 @@ GRANT USAGE ON CORTEX SEARCH SERVICE RISK_FRAUD_COPILOT.DOCUMENTS.REGULATORY_SEA
 GRANT SELECT ON SEMANTIC VIEW RISK_FRAUD_COPILOT.SEMANTIC.RISK_FRAUD_INTELLIGENCE TO ROLE AI_TRAINER;
 GRANT REFERENCES ON SEMANTIC VIEW RISK_FRAUD_COPILOT.SEMANTIC.RISK_FRAUD_INTELLIGENCE TO ROLE AI_TRAINER;
 
--- 11.10 Cortex Agent grant
-GRANT USAGE ON CORTEX AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
-GRANT MONITOR ON CORTEX AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
+-- 11.10 Agent grants
+GRANT USAGE ON AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
+GRANT MONITOR ON AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT TO ROLE AI_TRAINER;
 
 -- 11.11 Procedure grants
 GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.CREATE_INVESTIGATION_CASE(VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
@@ -1091,7 +1102,11 @@ GRANT CREATE FILE FORMAT ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
 GRANT CREATE STAGE ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
 GRANT CREATE DATASET ON SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
 
--- 11.13 Account-level grants
+-- 11.13 Dataset grants
+GRANT USAGE ON ALL DATASETS IN SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+GRANT USAGE ON FUTURE DATASETS IN SCHEMA RISK_FRAUD_COPILOT.APP TO ROLE AI_TRAINER;
+
+-- 11.14 Account-level grants
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE AI_TRAINER;
 
 -- 11.14 Database role grants
@@ -1102,7 +1117,236 @@ GRANT DATABASE ROLE SNOWFLAKE.CORTEX_AGENT_USER TO ROLE AI_TRAINER;
 GRANT USAGE ON DATABASE RISK_FRAUD_COPILOT TO ROLE PUBLIC;
 
 -- ============================================================
--- SECTION 12: VALIDATION QUERIES
+-- SECTION 12: INVESTIGATION WORKFLOW (End-to-End Pipeline)
+-- ============================================================
+
+-- 12.1 Investigation Workflow View (Signal -> Case -> SAR -> Audit)
+CREATE OR REPLACE VIEW RISK_FRAUD_COPILOT.APP.INVESTIGATION_WORKFLOW AS
+SELECT 
+    c.case_id,
+    c.account_id,
+    r.customer_name,
+    c.case_type,
+    c.status AS case_status,
+    c.priority,
+    c.created_at,
+    c.findings,
+    c.assigned_to,
+    c.resolution,
+    c.closed_at,
+    s.sar_id,
+    s.report_type,
+    s.status AS sar_status,
+    s.filing_date,
+    s.regulatory_body,
+    r.composite_risk_score,
+    r.fraud_risk_level,
+    r.compliance_risk_level,
+    a.flag_type,
+    a.severity AS flag_severity,
+    a.confidence_score AS flag_confidence,
+    a.description AS flag_description
+FROM RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT c
+LEFT JOIN RISK_FRAUD_COPILOT.PROCESSED.SAR_FILINGS s 
+    ON c.linked_sar_id = s.sar_id
+LEFT JOIN RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES r 
+    ON c.account_id = r.account_id
+LEFT JOIN RISK_FRAUD_COPILOT.PROCESSED.AML_FLAGS a 
+    ON c.account_id = a.account_id;
+
+-- 12.2 Update Case Status (lifecycle: OPEN -> INVESTIGATING -> PENDING_REVIEW -> CLOSED)
+CREATE OR REPLACE PROCEDURE RISK_FRAUD_COPILOT.APP.UPDATE_CASE_STATUS(
+    P_CASE_ID VARCHAR,
+    P_NEW_STATUS VARCHAR,
+    P_NOTES VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+BEGIN
+    LET current_status VARCHAR;
+    SELECT status INTO :current_status 
+    FROM RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT 
+    WHERE case_id = :P_CASE_ID;
+
+    IF (:current_status IS NULL) THEN
+        RETURN 'ERROR: Case ' || :P_CASE_ID || ' not found.';
+    END IF;
+
+    IF (:current_status = 'CLOSED') THEN
+        RETURN 'ERROR: Case ' || :P_CASE_ID || ' is already CLOSED and cannot be updated.';
+    END IF;
+
+    IF (:P_NEW_STATUS = 'CLOSED') THEN
+        UPDATE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT
+        SET status = :P_NEW_STATUS, resolution = :P_NOTES, closed_at = CURRENT_TIMESTAMP()
+        WHERE case_id = :P_CASE_ID;
+    ELSE
+        UPDATE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT
+        SET status = :P_NEW_STATUS, findings = COALESCE(findings, '') || CHR(10) || '[' || CURRENT_TIMESTAMP()::VARCHAR || '] ' || :P_NOTES
+        WHERE case_id = :P_CASE_ID;
+    END IF;
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY)
+    VALUES ('CASE_STATUS_UPDATE', 'CASE', :P_CASE_ID, 'Status changed from ' || :current_status || ' to ' || :P_NEW_STATUS || ': ' || :P_NOTES);
+
+    RETURN 'Case ' || :P_CASE_ID || ' updated: ' || :current_status || ' -> ' || :P_NEW_STATUS;
+END;
+
+-- 12.3 Link SAR to Case
+CREATE OR REPLACE PROCEDURE RISK_FRAUD_COPILOT.APP.LINK_SAR_TO_CASE(
+    P_CASE_ID VARCHAR,
+    P_SAR_ID VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+BEGIN
+    UPDATE RISK_FRAUD_COPILOT.PROCESSED.CASE_MANAGEMENT
+    SET linked_sar_id = :P_SAR_ID
+    WHERE case_id = :P_CASE_ID;
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY)
+    VALUES ('SAR_LINKED', 'CASE', :P_CASE_ID, 'SAR ' || :P_SAR_ID || ' linked to case ' || :P_CASE_ID);
+
+    RETURN 'SAR ' || :P_SAR_ID || ' linked to case ' || :P_CASE_ID || ' successfully.';
+END;
+
+-- 12.4 Validate Finding (confidence-weighted evidence summary)
+CREATE OR REPLACE PROCEDURE RISK_FRAUD_COPILOT.APP.VALIDATE_FINDING(
+    P_ACCOUNT_ID VARCHAR,
+    P_FINDING_TYPE VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+BEGIN
+    LET evidence VARCHAR DEFAULT '';
+    LET signal_count NUMBER DEFAULT 0;
+    LET avg_confidence NUMBER(3,2) DEFAULT 0;
+    LET risk_score NUMBER DEFAULT 0;
+    LET aml_count NUMBER DEFAULT 0;
+    LET confidence_level VARCHAR DEFAULT 'LOW';
+
+    SELECT COUNT(*), COALESCE(AVG(confidence_score), 0)
+    INTO :signal_count, :avg_confidence
+    FROM RISK_FRAUD_COPILOT.PROCESSED.FRAUD_SIGNALS
+    WHERE account_id = :P_ACCOUNT_ID;
+
+    SELECT COALESCE(composite_risk_score, 0)
+    INTO :risk_score
+    FROM RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES
+    WHERE account_id = :P_ACCOUNT_ID;
+
+    SELECT COUNT(*)
+    INTO :aml_count
+    FROM RISK_FRAUD_COPILOT.PROCESSED.AML_FLAGS
+    WHERE account_id = :P_ACCOUNT_ID;
+
+    IF (:avg_confidence >= 0.8 AND :signal_count >= 3) THEN
+        confidence_level := 'HIGH';
+    ELSEIF (:avg_confidence >= 0.6 AND :signal_count >= 1) THEN
+        confidence_level := 'MEDIUM';
+    ELSE
+        confidence_level := 'LOW';
+    END IF;
+
+    evidence := OBJECT_CONSTRUCT(
+        'account_id', :P_ACCOUNT_ID,
+        'finding_type', :P_FINDING_TYPE,
+        'fraud_signal_count', :signal_count,
+        'aml_flag_count', :aml_count,
+        'avg_signal_confidence', :avg_confidence,
+        'composite_risk_score', :risk_score,
+        'overall_confidence', :confidence_level,
+        'recommendation', CASE 
+            WHEN :confidence_level = 'HIGH' THEN 'Sufficient evidence for regulatory filing'
+            WHEN :confidence_level = 'MEDIUM' THEN 'Additional investigation recommended before filing'
+            ELSE 'Insufficient evidence - manual review required'
+        END,
+        'validated_at', CURRENT_TIMESTAMP()::VARCHAR
+    )::VARCHAR;
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY, CONFIDENCE_SCORE)
+    VALUES ('FINDING_VALIDATED', 'ACCOUNT', :P_ACCOUNT_ID, :P_FINDING_TYPE || ' validation: ' || :confidence_level, :avg_confidence);
+
+    RETURN evidence;
+END;
+
+-- 12.5 Grants for new objects
+GRANT SELECT ON VIEW RISK_FRAUD_COPILOT.APP.INVESTIGATION_WORKFLOW TO ROLE AI_TRAINER;
+GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.UPDATE_CASE_STATUS(VARCHAR, VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
+GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.LINK_SAR_TO_CASE(VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
+GRANT USAGE ON PROCEDURE RISK_FRAUD_COPILOT.APP.VALIDATE_FINDING(VARCHAR, VARCHAR) TO ROLE AI_TRAINER;
+
+-- ============================================================
+-- SECTION 13: COCO AUTOMATION (Scheduled Tasks)
+-- ============================================================
+
+-- 13.1 Daily High-Risk Account Scan
+-- Identifies accounts that crossed risk threshold 50 and logs findings
+CREATE OR REPLACE TASK RISK_FRAUD_COPILOT.APP.DAILY_HIGH_RISK_SCAN
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = 'USING CRON 0 8 * * * Asia/Kolkata'
+    COMMENT = 'Daily scan for accounts crossing high-risk threshold'
+AS
+BEGIN
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY, CONFIDENCE_SCORE)
+    SELECT 
+        'HIGH_RISK_ALERT',
+        'ACCOUNT',
+        account_id,
+        'Daily scan: ' || customer_name || ' risk score ' || composite_risk_score || 
+        ' (fraud: ' || fraud_risk_level || ', compliance: ' || compliance_risk_level || ')',
+        composite_risk_score / 100.0
+    FROM RISK_FRAUD_COPILOT.PROCESSED.RISK_SCORES
+    WHERE composite_risk_score > 50
+      AND score_calculated_at >= DATEADD(day, -1, CURRENT_TIMESTAMP());
+END;
+
+-- 13.2 Weekly AML Summary Report
+-- Aggregates AML flags from past 7 days into an audit summary
+CREATE OR REPLACE TASK RISK_FRAUD_COPILOT.APP.WEEKLY_AML_SUMMARY
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = 'USING CRON 0 9 * * 1 Asia/Kolkata'
+    COMMENT = 'Weekly AML flag summary report'
+AS
+BEGIN
+    LET structuring_count NUMBER DEFAULT 0;
+    LET intl_count NUMBER DEFAULT 0;
+    LET pep_count NUMBER DEFAULT 0;
+    LET total_flags NUMBER DEFAULT 0;
+
+    SELECT 
+        COUNT(CASE WHEN flag_type = 'STRUCTURING' THEN 1 END),
+        COUNT(CASE WHEN flag_type = 'HIGH_VALUE_INTERNATIONAL' THEN 1 END),
+        COUNT(CASE WHEN flag_type = 'PEP_ACTIVITY' THEN 1 END),
+        COUNT(*)
+    INTO :structuring_count, :intl_count, :pep_count, :total_flags
+    FROM RISK_FRAUD_COPILOT.PROCESSED.AML_FLAGS
+    WHERE flag_date >= DATEADD(day, -7, CURRENT_DATE());
+
+    INSERT INTO RISK_FRAUD_COPILOT.PROCESSED.AUDIT_LOG (ACTION_TYPE, ENTITY_TYPE, ENTITY_ID, RESPONSE_SUMMARY)
+    VALUES (
+        'WEEKLY_AML_SUMMARY',
+        'REPORT',
+        'AML_WEEKLY_' || TO_CHAR(CURRENT_DATE(), 'YYYYMMDD'),
+        'Weekly AML Summary: ' || :total_flags || ' total flags (' ||
+        :structuring_count || ' structuring, ' || :intl_count || ' high-value intl, ' ||
+        :pep_count || ' PEP activity). Period: ' || 
+        TO_CHAR(DATEADD(day, -7, CURRENT_DATE()), 'YYYY-MM-DD') || ' to ' || TO_CHAR(CURRENT_DATE(), 'YYYY-MM-DD')
+    );
+END;
+
+-- Tasks are created in suspended state. Resume when ready:
+-- ALTER TASK RISK_FRAUD_COPILOT.APP.DAILY_HIGH_RISK_SCAN RESUME;
+-- ALTER TASK RISK_FRAUD_COPILOT.APP.WEEKLY_AML_SUMMARY RESUME;
+
+-- ============================================================
+-- SECTION 14: VALIDATION QUERIES
 -- ============================================================
 
 
