@@ -107,12 +107,12 @@ fraud_summary = load_fraud_summary()
 aml_summary = load_aml_summary()
 
 kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-kpi1.metric("Accounts Monitored", f"{risk_summary['TOTAL_ACCOUNTS']:,}")
-kpi2.metric("High Risk (>50)", risk_summary['HIGH_RISK_COUNT'], delta=None)
-kpi3.metric("Avg Risk Score", risk_summary['AVG_SCORE'])
-kpi4.metric("Fraud Signals (7d)", fraud_summary['TOTAL_SIGNALS'])
-kpi5.metric("AML Flags", aml_summary['TOTAL_FLAGS'])
-kpi6.metric("Pending STR Filing", aml_summary['PENDING_STR'], delta=None)
+kpi1.metric("Accounts Monitored", f"{int(risk_summary['TOTAL_ACCOUNTS']):,}")
+kpi2.metric("High Risk (>50)", int(risk_summary['HIGH_RISK_COUNT']))
+kpi3.metric("Avg Risk Score", float(risk_summary['AVG_SCORE']))
+kpi4.metric("Fraud Signals (7d)", int(fraud_summary['TOTAL_SIGNALS']))
+kpi5.metric("AML Flags", int(aml_summary['TOTAL_FLAGS']))
+kpi6.metric("Pending STR Filing", int(aml_summary['PENDING_STR']))
 
 st.divider()
 
@@ -129,7 +129,7 @@ with tab_overview:
     with col_left:
         st.subheader("Risk Score Distribution")
         dist_df = load_risk_distribution()
-        st.bar_chart(dist_df, x="RISK_BAND", y="ACCOUNT_COUNT", horizontal=True)
+        st.bar_chart(dist_df, x="RISK_BAND", y="ACCOUNT_COUNT")
 
     with col_right:
         st.subheader("Threat Summary")
@@ -158,17 +158,7 @@ with tab_overview:
     st.dataframe(
         top_accounts,
         use_container_width=True,
-        column_config={
-            "COMPOSITE_RISK_SCORE": st.column_config.ProgressColumn(
-                "Risk Score", min_value=0, max_value=100, format="%d"
-            ),
-            "TOTAL_TRANSACTION_VOLUME": st.column_config.NumberColumn(
-                "Txn Volume", format="%.0f"
-            ),
-            "PEP_FLAG": st.column_config.CheckboxColumn("PEP"),
-            "SANCTIONS_FLAG": st.column_config.CheckboxColumn("Sanctioned"),
-        },
-        hide_index=True,
+        
     )
 
 # ==================== TAB: AI COPILOT ====================
@@ -286,13 +276,7 @@ with tab_fraud:
         st.dataframe(
             fraud_df,
             use_container_width=True,
-            column_config={
-                "CONFIDENCE_SCORE": st.column_config.ProgressColumn(
-                    "Confidence", min_value=0, max_value=1, format="%.2f"
-                ),
-                "AMOUNT": st.column_config.NumberColumn("Amount", format="%.2f"),
-            },
-            hide_index=True,
+            
         )
     else:
         st.info("No fraud signals matching the selected filters.")
@@ -359,15 +343,7 @@ with tab_aml:
         st.dataframe(
             aml_df,
             use_container_width=True,
-            column_config={
-                "COMPOSITE_RISK_SCORE": st.column_config.ProgressColumn(
-                    "Risk Score", min_value=0, max_value=100, format="%d"
-                ),
-                "CONFIDENCE_SCORE": st.column_config.ProgressColumn(
-                    "Confidence", min_value=0, max_value=1, format="%.2f"
-                ),
-            },
-            hide_index=True,
+            
         )
     else:
         st.info("No AML alerts matching the selected filters.")
@@ -421,20 +397,7 @@ with tab_risk:
         st.dataframe(
             risk_df,
             use_container_width=True,
-            column_config={
-                "COMPOSITE_RISK_SCORE": st.column_config.ProgressColumn(
-                    "Risk Score", min_value=0, max_value=100, format="%d"
-                ),
-                "TOTAL_TRANSACTION_VOLUME": st.column_config.NumberColumn(
-                    "Txn Volume", format="%.0f"
-                ),
-                "HIGH_RISK_CATEGORY_VOLUME": st.column_config.NumberColumn(
-                    "High-Risk Vol", format="%.0f"
-                ),
-                "PEP_FLAG": st.column_config.CheckboxColumn("PEP"),
-                "SANCTIONS_FLAG": st.column_config.CheckboxColumn("Sanctioned"),
-            },
-            hide_index=True,
+            
         )
     else:
         st.info("No accounts matching the selected filters.")
@@ -464,7 +427,7 @@ with tab_actions:
                 count = status_counts.get(status, 0)
                 status_cols[i].metric(status, count)
 
-            st.dataframe(case_df, use_container_width=True, hide_index=True)
+            st.dataframe(case_df, use_container_width=True)
 
             st.divider()
             st.markdown("**Update Case Status**")
@@ -557,7 +520,7 @@ with tab_actions:
             sar_cols[0].metric("DRAFT", sar_status_counts.get("DRAFT", 0))
             sar_cols[1].metric("REVIEW", sar_status_counts.get("REVIEW", 0))
             sar_cols[2].metric("SUBMITTED", sar_status_counts.get("SUBMITTED", 0))
-            st.dataframe(sar_df, use_container_width=True, hide_index=True)
+            st.dataframe(sar_df, use_container_width=True)
         else:
             st.info("No SAR filings yet.")
 
@@ -604,7 +567,7 @@ with tab_actions:
 
                 if not report_data.empty:
                     st.markdown(f"**Total findings:** {len(report_data)} accounts requiring STR filing")
-                    st.dataframe(report_data, use_container_width=True, hide_index=True)
+                    st.dataframe(report_data, use_container_width=True)
                     st.download_button(
                         "Download CSV",
                         report_data.to_csv(index=False),
@@ -656,12 +619,7 @@ with tab_audit:
         st.dataframe(
             audit_df,
             use_container_width=True,
-            column_config={
-                "CONFIDENCE_SCORE": st.column_config.ProgressColumn(
-                    "Confidence", min_value=0, max_value=1, format="%.2f"
-                ),
-            },
-            hide_index=True,
+            
         )
     else:
         st.info("No audit events matching the selected filters.")
@@ -673,4 +631,4 @@ with st.sidebar:
     st.caption("Snowflake Cortex AI | Real-time Monitoring")
     if st.button("Refresh Data", use_container_width=True):
         st.cache_data.clear()
-        st.rerun()
+        st.experimental_rerun()

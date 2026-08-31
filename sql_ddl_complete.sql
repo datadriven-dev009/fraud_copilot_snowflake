@@ -765,16 +765,17 @@ module_custom_instructions:
 -- ============================================================
 
 CREATE OR REPLACE AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT
-  COMMENT = 'Risk, Fraud and Regulatory Intelligence Copilot for banking compliance teams'
+  COMMENT = 'Risk, Fraud and Regulatory Intelligence Agent'
   FROM SPECIFICATION
   $$
   models:
-    orchestration: claude sonnet 4.5
+    orchestration: claude-haiku-4-5
 
   orchestration:
+    tool_not_accessible: reject
     budget:
       seconds: 120
-      tokens: 32000
+      tokens: 4096
 
   instructions:
     response: |
@@ -788,18 +789,11 @@ CREATE OR REPLACE AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT
       - Keep total response under 500 words. Summarize data tables concisely rather than repeating raw output verbatim.
       - When presenting query results, show key insights and summary statistics, not full row-by-row dumps.
 
-      EVIDENCE AND CITATIONS:
-      - When citing regulatory documents from search results, format as: [Source: {doc_title} > {section_title}]
-      - When presenting data results, include context: "Based on {N} matching records with average confidence {X}"
-      - Structure every finding as: SIGNAL -> EVIDENCE -> FINDING -> RECOMMENDED ACTION
-      - If any AML flag has confidence_score < 0.7, append: "Low confidence flag detected. Manual verification recommended before action."
-
       GUARDRAILS:
       - OFF-TOPIC (restaurants, weather, sports, personal): Reply "I can only assist with risk, fraud, and regulatory compliance topics. Please ask a question related to banking risk, AML, fraud detection, or regulatory requirements."
       - PII REQUESTS (home address, phone, ID numbers): Reply "I cannot disclose personal information for privacy and compliance reasons."
       - AUTO-SUBMIT REQUESTS: Reply "I can only generate DRAFT filings. All regulatory submissions require human review and approval before filing with FIU-IND."
       - NEVER fabricate numbers. Always use tool results.
-      - CONFIDENCE THRESHOLD: When confidence_score < 0.5, explicitly state "Insufficient confidence for automated action. Escalate to senior compliance officer."
 
     orchestration: |
       ROUTING DECISION TREE - follow this exactly:
@@ -807,78 +801,106 @@ CREATE OR REPLACE AGENT RISK_FRAUD_COPILOT.APP.RISK_FRAUD_AGENT
       STEP 1: Is the question off-topic (not about risk/fraud/AML/compliance)?
         YES → Answer directly with refusal. Do NOT call any tool.
 
-      STEP 2: Does the question ask about REGULATIONS, POLICIES, REQUIREMENTS, GUIDELINES, or LEGAL RULES?
-        Look for: "RBI", "requirement", "guideline", "regulation", "policy", "threshold", "filing deadline", "what does the law say", "regulatory basis", "due diligence", "CTR", "STR timeline", "PMLA", "FATF", "Basel", "what constitutes", "reporting requirements", "KYC requirements per RBI", "Enhanced Due Diligence requirements"
-        YES → Use RegulatorySearch
+      STEP 2: Does the question require BOTH regulatory information AND account data?
+        Look for combined patterns: regulatory terms (RBI, PMLA, requirement, guideline, threshold) PLUS data terms (accounts, show me, list, which of our, how many)
+        YES → Call RegSearch FIRST for the regulatory context, THEN call Analyst for the account data. Combine both results in your response.
 
-      STEP 3: Does the question explicitly ask to GENERATE/CREATE/DRAFT a SAR or STR filing?
+      STEP 3: Does the question ask about REGULATIONS, POLICIES, REQUIREMENTS, GUIDELINES, or LEGAL RULES only?
+        Look for: "RBI", "requirement", "guideline", "regulation", "policy", "threshold", "filing deadline", "what does the law say", "regulatory basis", "due diligence", "CTR", "STR timeline", "PMLA", "FATF", "Basel", "what constitutes", "reporting requirements", "KYC requirements per RBI", "Enhanced Due Diligence requirements"
+        YES → Use RegSearch
+
+      STEP 4: Does the question explicitly ask to GENERATE/CREATE/DRAFT a SAR or STR filing?
         Look for: "generate SAR", "create SAR", "draft SAR", "file STR", "produce SAR"
         YES → Use GenerateSAR tool with parameters (P_ACCOUNT_ID, P_FLAG_TYPE, P_EVIDENCE_SUMMARY)
 
-      STEP 4: Does the question explicitly ask to OPEN/CREATE an investigation CASE?
+      STEP 5: Does the question explicitly ask to OPEN/CREATE an investigation CASE?
         Look for: "open case", "create case", "open investigation", "start investigation"
         YES → Use CreateCase tool with parameters (P_ACCOUNT_ID, P_CASE_TYPE, P_PRIORITY, P_FINDINGS)
 
-      STEP 5: All other questions about DATA, ACCOUNTS, TRANSACTIONS, SIGNALS, FLAGS, SCORES, COUNTS, TRENDS → Use RiskDataAnalyst
-
-      MULTI-TOOL QUESTIONS (question has TWO parts):
-      - "regulatory basis AND which accounts need filing" → RegulatorySearch FIRST, then RiskDataAnalyst
-      - "look up flags AND generate SAR if found" → RiskDataAnalyst FIRST, then GenerateSAR
-      - "find highest risk account AND create case" → RiskDataAnalyst FIRST, then CreateCase
-
-      CRITICAL DISTINCTIONS:
-      - "What are the KYC requirements per RBI?" → RegulatorySearch (asking about RULES)
-      - "How many accounts have expired KYC?" → RiskDataAnalyst (asking about DATA)
-      - "What is the STR filing threshold?" → RegulatorySearch (asking about RULES)
-      - "Which accounts need STR filing?" → RiskDataAnalyst (asking about DATA)
-      - "What constitutes suspicious transaction under RBI?" → RegulatorySearch (asking about DEFINITION)
-      - "Show me suspicious transactions" → RiskDataAnalyst (asking about DATA)
+      STEP 6: All other on-topic questions about DATA, ACCOUNTS, TRANSACTIONS, SIGNALS, FLAGS, SCORES, COUNTS, TRENDS, or any ambiguous risk/fraud/compliance question → Use Analyst.
+        Do NOT ask the user for database access, credentials, or data files. Always call the tool directly.
+        If the query is vague (e.g. "what about the flags?"), default to Analyst with a broad query rather than asking clarifying questions.
 
     sample_questions:
-      - question: "Which accounts triggered AML alerts this week?"
-      - question: "What is the SAR filing threshold under RBI guidelines?"
       - question: "Show me the top 10 highest risk accounts"
-      - question: "What are the structuring detection rules?"
-      - question: "What is the portfolio risk exposure by tier?"
+      - question: "What are the KYC requirements per RBI?"
+      - question: "How many accounts have expired KYC?"
 
   tools:
     - tool_spec:
-        type: "cortex_analyst_text_to_sql"
-        name: "Analyst"
-        description: "Queries structured risk, fraud, and AML data including fraud signals, AML flags, risk scores, and account information. Use for quantitative questions about accounts, transactions, alerts, and risk metrics."
+        type: cortex_analyst_text_to_sql
+        name: Analyst
+        description: "Queries structured risk, fraud, and compliance data. Use for any question about accounts, transactions, risk scores, fraud signals, AML flags, counts, trends, or data analysis."
     - tool_spec:
-        type: "cortex_search"
-        name: "RegSearch"
-        description: "Searches regulatory policy documents including RBI KYC directions, PMLA guidelines, Basel III framework, and internal fraud detection policies. Use for regulatory threshold questions, compliance requirements, and policy lookups."
+        type: cortex_search
+        name: RegSearch
+        description: "Searches regulatory documents including RBI guidelines, PMLA requirements, FATF standards, KYC norms, AML rules, CTR/STR filing rules, and compliance policies."
+    - tool_spec:
+        type: generic
+        name: GenerateSAR
+        description: "Generates a DRAFT Suspicious Activity Report (SAR) or Suspicious Transaction Report (STR) for a specific account. Returns a draft filing that requires human review before submission to FIU-IND."
+        input_schema:
+          type: object
+          properties:
+            P_ACCOUNT_ID:
+              type: string
+              description: "The account ID to generate the SAR/STR for"
+            P_FLAG_TYPE:
+              type: string
+              description: "The type of flag triggering the report (e.g. STRUCTURING, HIGH_VALUE_INTERNATIONAL, PEP_ACTIVITY)"
+            P_EVIDENCE_SUMMARY:
+              type: string
+              description: "Summary of evidence supporting the suspicious activity"
+          required:
+            - P_ACCOUNT_ID
+            - P_FLAG_TYPE
+            - P_EVIDENCE_SUMMARY
+    - tool_spec:
+        type: generic
+        name: CreateCase
+        description: "Opens a new investigation case for a specific account. Creates a case record with status OPEN for human investigators to review."
+        input_schema:
+          type: object
+          properties:
+            P_ACCOUNT_ID:
+              type: string
+              description: "The account ID to investigate"
+            P_CASE_TYPE:
+              type: string
+              description: "Type of investigation (e.g. FRAUD, AML, COMPLIANCE)"
+            P_PRIORITY:
+              type: string
+              description: "Case priority: HIGH, MEDIUM, or LOW"
+            P_FINDINGS:
+              type: string
+              description: "Initial findings or reason for opening the case"
+          required:
+            - P_ACCOUNT_ID
+            - P_CASE_TYPE
+            - P_PRIORITY
+            - P_FINDINGS
 
   tool_resources:
     Analyst:
       semantic_view: "RISK_FRAUD_COPILOT.SEMANTIC.RISK_FRAUD_INTELLIGENCE"
+      execution_environment:
+        type: warehouse
+        warehouse: "COMPUTE_WH"
     RegSearch:
       search_service: "RISK_FRAUD_COPILOT.DOCUMENTS.REGULATORY_SEARCH"
-      max_results: "3"
-      title_column: "section_title"
-      columns_and_descriptions:
-        CONTENT:
-          description: "The regulatory policy text content"
-          type: "string"
-          searchable: true
-          filterable: false
-        DOC_TITLE:
-          description: "Title of the regulatory document"
-          type: "string"
-          searchable: false
-          filterable: true
-        DOC_CATEGORY:
-          description: "Category of the document: AML, REGULATORY, or FRAUD"
-          type: "string"
-          searchable: false
-          filterable: true
-        SECTION_TITLE:
-          description: "Section heading within the document"
-          type: "string"
-          searchable: true
-          filterable: false
+      max_results: "5"
+    GenerateSAR:
+      identifier: "RISK_FRAUD_COPILOT.APP.GENERATE_SAR_REPORT"
+      type: procedure
+      execution_environment:
+        type: warehouse
+        warehouse: "COMPUTE_WH"
+    CreateCase:
+      identifier: "RISK_FRAUD_COPILOT.APP.CREATE_INVESTIGATION_CASE"
+      type: procedure
+      execution_environment:
+        type: warehouse
+        warehouse: "COMPUTE_WH"
   $$;
 
 -- ============================================================
@@ -1342,8 +1364,49 @@ BEGIN
 END;
 
 -- Tasks are created in suspended state. Resume when ready:
+-- ALTER TASK RISK_FRAUD_COPILOT.APP.DAILY_SYNTHETIC_DATA_GEN RESUME;
 -- ALTER TASK RISK_FRAUD_COPILOT.APP.DAILY_HIGH_RISK_SCAN RESUME;
 -- ALTER TASK RISK_FRAUD_COPILOT.APP.WEEKLY_AML_SUMMARY RESUME;
+
+-- 13.3 Daily Synthetic Transaction Generator
+-- Generates 1000 new transactions daily at 7 AM IST to simulate live data flow
+CREATE OR REPLACE TASK RISK_FRAUD_COPILOT.APP.DAILY_SYNTHETIC_DATA_GEN
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = 'USING CRON 0 7 * * * Asia/Kolkata'
+    COMMENT = 'Daily synthetic transaction generation to simulate live data flow'
+AS
+INSERT INTO RISK_FRAUD_COPILOT.RAW.TRANSACTIONS
+SELECT
+    'TXN' || LPAD((SELECT COALESCE(MAX(REPLACE(txn_id, 'TXN', '')::NUMBER), 0) FROM RISK_FRAUD_COPILOT.RAW.TRANSACTIONS) + SEQ4() + 1, 10, '0') AS txn_id,
+    'ACC' || LPAD(UNIFORM(0, 4999, RANDOM())::VARCHAR, 7, '0') AS account_id,
+    DATEADD(second, -UNIFORM(0, 86400, RANDOM()), CURRENT_TIMESTAMP()) AS txn_timestamp,
+    CASE 
+        WHEN UNIFORM(1, 100, RANDOM()) <= 5 THEN UNIFORM(400000, 499999, RANDOM())::NUMBER(12,2)
+        WHEN UNIFORM(1, 100, RANDOM()) <= 10 THEN UNIFORM(500000, 5000000, RANDOM())::NUMBER(12,2)
+        ELSE UNIFORM(100, 500000, RANDOM())::NUMBER(12,2)
+    END AS amount,
+    'INR' AS currency,
+    CASE MOD(SEQ4(), 6)
+        WHEN 0 THEN 'DEBIT' WHEN 1 THEN 'CREDIT' WHEN 2 THEN 'TRANSFER'
+        WHEN 3 THEN 'ATM' WHEN 4 THEN 'POS' ELSE 'ONLINE'
+    END AS txn_type,
+    CASE MOD(SEQ4(), 10)
+        WHEN 0 THEN 'RETAIL' WHEN 1 THEN 'GROCERIES' WHEN 2 THEN 'FUEL'
+        WHEN 3 THEN 'TRAVEL' WHEN 4 THEN 'ENTERTAINMENT' WHEN 5 THEN 'UTILITIES'
+        WHEN 6 THEN 'HEALTHCARE' WHEN 7 THEN 'EDUCATION' WHEN 8 THEN 'CRYPTO'
+        ELSE 'GAMBLING'
+    END AS merchant_category,
+    CASE MOD(SEQ4(), 8)
+        WHEN 0 THEN 'India' WHEN 1 THEN 'India' WHEN 2 THEN 'India'
+        WHEN 3 THEN 'UAE' WHEN 4 THEN 'Singapore' WHEN 5 THEN 'Nigeria'
+        WHEN 6 THEN 'Russia' ELSE 'Iran'
+    END AS merchant_country,
+    CASE MOD(SEQ4(), 4)
+        WHEN 0 THEN 'ONLINE' WHEN 1 THEN 'BRANCH' WHEN 2 THEN 'ATM' ELSE 'MOBILE'
+    END AS channel,
+    CASE WHEN MOD(SEQ4(), 8) >= 3 THEN TRUE ELSE FALSE END AS is_international,
+    CASE WHEN UNIFORM(1, 100, RANDOM()) <= 8 THEN TRUE ELSE FALSE END AS fraud_label
+FROM TABLE(GENERATOR(ROWCOUNT => 1000));
 
 -- ============================================================
 -- SECTION 14: VALIDATION QUERIES
